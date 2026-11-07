@@ -1,0 +1,409 @@
+name: Daily sync and release
+
+# Keeps this fork level with upstream, builds it, and publishes a pre-release of every new upstream
+# state. The build steps mirror .github/workflows/release.yml (same cache keys, same toolchain), so a
+# run here shares that workflow's ccache and starts warm. Only the trigger differs: this one is on a
+# clock, and it names its releases by date.
+#
+# Nothing is built when upstream has no new commits; the run ends after the comparison. Use
+# "Run workflow" with "force" to build anyway.
+on:
+  schedule:
+    # 20:05 UTC = 04:05 Asia/Shanghai; five past the hour to stay off the top-of-hour rush.
+    - cron: '5 20 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Release even when upstream has no new commits"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# One sync or build at a time: two runs merging into main together would race, and a second build
+# would publish a duplicate for the same upstream state. A queued run waits rather than cancelling.
+concurrency:
+  group: daily-release
+  cancel-in-progress: false
+
+env:
+  CCACHE_MAXSIZE: 4G
+  UPSTREAM_REPO: heydemoura/EglantinePS5
+
+jobs:
+  sync:
+    name: Sync with upstream
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+      main_head: ${{ steps.merge.outputs.main_head }}
+    steps:
+      # behind_by counts the upstream commits this fork's main does not have yet. Comparing commit
+      # SHAs would not do: this workflow's own file is a commit on the fork, so the two tips differ
+      # even when upstream has nothing new.
+      - name: Compare main with upstream
+        id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          behind=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$UPSTREAM_REPO:main" --jq .behind_by)
+          echo "Upstream main is $behind commit(s) ahead of this fork."
+          if [[ $behind -gt 0 ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif [[ ${FORCE:-false} == true ]]; then
+            echo "::notice title=Forced::No new upstream commits; building anyway."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=Up to date::No new upstream commits since the last release."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream into main
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Merges upstream into the fork's main (a fast-forward while the fork has no own commits
+          # past it). A conflict fails the job instead of leaving a half-synced repository.
+          gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=main --jq '"merge: \(.merge_type)"'
+          # Read back the new tip: github.sha still points at the commit this run started from.
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          echo "main_head=$head" >> "$GITHUB_OUTPUT"
+          echo "main is now $head"
+
+  build:
+    name: Build
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    # Reading the source, and signing the ZIP's attestation.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      tag: ${{ steps.name.outputs.tag }}
+      version: ${{ steps.name.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Free disk space
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go \
+            /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk /opt/hostedtoolcache/PyPy \
+            /opt/hostedtoolcache/Ruby
+          df -h "$GITHUB_WORKSPACE"
+
+      # Explicit ref: the default would be github.sha, the commit this run started from, which the
+      # sync job has since moved past.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.sync.outputs.main_head }}
+          submodules: true
+
+      - name: Locate the caches
+        run: |
+          cache_root=$(dirname "$GITHUB_WORKSPACE")/ci-cache
+          mkdir -p "$cache_root"
+          {
+            echo "CACHE_ROOT=$cache_root"
+            echo "RADV_NATIVE=$(dirname "$GITHUB_WORKSPACE")/mihawk-vulkan-review/.deps/native"
+            echo "EGLANTINEPS5_DEPS_CACHE=$cache_root/downloads"
+            echo "CCACHE_DIR=$cache_root/ccache"
+            echo "XDG_CACHE_HOME=$cache_root/xdg"
+            echo "JOBS=$(nproc)"
+            echo "RADV_BUILD_JOBS=$(nproc)"
+            echo "SPIRV_TRANSLATOR=$cache_root/spirv-llvm-translator"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore the SPIR-V LLVM translator
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.SPIRV_TRANSLATOR }}
+          key: spirv-llvm-translator-${{ hashFiles('tools/ci/setup-ubuntu-24.04.sh', 'tools/ci/ubuntu-24.04-packages.txt') }}
+
+      - name: Install the build tools (tools/ci/setup-ubuntu-24.04.sh)
+        run: |
+          bash tools/ci/setup-ubuntu-24.04.sh "$SPIRV_TRANSLATOR" 3>> "$GITHUB_ENV"
+          make toolchain
+
+      - name: Restore downloads
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.CACHE_ROOT }}/downloads
+          key: downloads-${{ hashFiles('tools/deps.json') }}
+
+      - name: Fetch dependencies
+        run: make deps
+
+      - name: Restore the RADV driver
+        id: radv
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ${{ env.RADV_NATIVE }}/radv-release
+            ${{ env.RADV_NATIVE }}/ps5-payload-sdk
+            ${{ env.RADV_NATIVE }}/zlib
+            build/radv-isolated
+          key: radv-3-${{ hashFiles('tools/deps.json', 'tools/patch-radv-wsi.py', 'tools/build-radv-dependencies.sh', 'tools/isolate-radv.py', 'tools/ci/ubuntu-24.04-packages.txt', 'tools/ci/setup-ubuntu-24.04.sh') }}
+
+      # Same key prefix as release.yml: the two workflows hand each other their ccache.
+      - name: Restore ccache
+        id: ccache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.CACHE_ROOT }}/ccache
+          key: ccache-u24-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-u24-
+
+      - name: Fetch the ccache snapshot
+        if: steps.ccache.outputs.cache-matched-key == ''
+        run: |
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/build-cache/ccache-u24.tar"
+          if curl -fsSL --retry 3 -o "$RUNNER_TEMP/ccache-u24.tar" "$url"; then
+            mkdir -p "$CCACHE_DIR"
+            tar -xf "$RUNNER_TEMP/ccache-u24.tar" -C "$CCACHE_DIR"
+            rm "$RUNNER_TEMP/ccache-u24.tar"
+            echo "::notice title=ccache::Started from the build-cache snapshot."
+          else
+            echo "::notice title=ccache::No snapshot to start from; this run compiles everything."
+          fi
+
+      - name: Build and package
+        id: build
+        timeout-minutes: 315
+        run: |
+          ccache --zero-stats
+          bash tools/ci/build-release.sh
+
+      - name: Report disk, ccache and the linker
+        if: always()
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          ccache --show-stats || true
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.CACHE_ROOT }}/ccache
+          key: ccache-u24-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save the RADV driver
+        if: always() && steps.radv.outputs.cache-hit != 'true' && hashFiles('build/radv-isolated/libvulkan_radeon.ps5.a') != ''
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ${{ env.RADV_NATIVE }}/radv-release
+            ${{ env.RADV_NATIVE }}/ps5-payload-sdk
+            ${{ env.RADV_NATIVE }}/zlib
+            build/radv-isolated
+          key: radv-3-${{ hashFiles('tools/deps.json', 'tools/patch-radv-wsi.py', 'tools/build-radv-dependencies.sh', 'tools/isolate-radv.py', 'tools/ci/ubuntu-24.04-packages.txt', 'tools/ci/setup-ubuntu-24.04.sh') }}
+
+      # nightly-YYYYMMDD, in Asia/Shanghai. Deliberately not a v* tag: those belong to upstream's
+      # versioned releases, and v* is what release.yml builds on. A second release on the same day
+      # gets a .2, .3 suffix.
+      - name: Name this release
+        id: name
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          archive=$(ls dist/EglantinePS5-v*.zip)
+          version=$(python3 - "$archive" <<'PY'
+          import json, sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as z:
+              raw = json.loads(z.read("PPSA98515/sce_sys/param.json"))["contentVersion"]
+          print(raw.removeprefix("0"))
+          PY
+          )
+          day=$(TZ=Asia/Shanghai date +%Y%m%d)
+          tag="nightly-${day}"
+          n=1
+          while gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; do
+            n=$((n + 1))
+            tag="nightly-${day}.${n}"
+          done
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $archive as $tag (package version $version)"
+
+      # The same self-check release.yml runs: intact, eboot.bin present, every entry 0777 (the
+      # console only starts an app whose files are open to all), checksum matches.
+      - name: Check the ZIP and its checksum
+        run: |
+          set -euo pipefail
+          cd dist
+          python3 - EglantinePS5-v*.zip <<'PY'
+          import json, sys, zipfile
+          assert len(sys.argv) == 2, f"expected one ZIP: {sys.argv[1:]}"
+          archive = sys.argv[1]
+          with zipfile.ZipFile(archive) as z:
+              assert z.testzip() is None, "damaged entry"
+              names = z.namelist()
+              assert "PPSA98515/eboot.bin" in names, "no eboot.bin"
+              wrong = [i.filename for i in z.infolist() if (i.external_attr >> 16) & 0o777 != 0o777]
+              assert not wrong, f"entries not stored as 0777: {wrong[:3]}"
+              version = json.loads(z.read("PPSA98515/sce_sys/param.json"))["contentVersion"]
+              assert archive == f"EglantinePS5-v{version.removeprefix('0')}.zip", (archive, version)
+              print(f"{archive}: {len(names)} entries, all 0777, version {version}")
+          PY
+          sha256sum -c SHA256SUMS
+
+      - name: Attest the release ZIP
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/EglantinePS5-v*.zip
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: EglantinePS5
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      # The unstripped executable that reads this build's crash reports; not published.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: EglantinePS5-symbols
+          path: build/symbols/
+          if-no-files-found: warn
+          retention-days: 7
+
+  publish:
+    name: Publish pre-release
+    needs: [sync, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: EglantinePS5
+          path: dist
+
+      # make-dist.py only writes dist/release-notes.md when README.md carries a
+      # "## Changes in v<version>" section, and upstream adds that section when they cut a versioned
+      # release — not on main, where the version stays put between releases. So the notes are
+      # composed here: provenance, what changed since the previous nightly, and the checksum.
+      - name: Compose the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+          HEAD: ${{ needs.sync.outputs.main_head }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          archive="dist/EglantinePS5-v${VERSION}.zip"
+          digest=$(sha256sum "$archive" | cut -d' ' -f1)
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          previous=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[].tag_name' 2>/dev/null \
+            | grep -E '^nightly-[0-9]{8}(\.[0-9]+)?$' | sort -r | head -1 || true)
+
+          {
+            echo "Daily build of upstream \`${UPSTREAM_REPO}\` at \`${HEAD:0:12}\`."
+            echo
+            echo "> Upstream describes itself as **VERY experimental**. Expect breakage."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| package version | \`${VERSION}\` |"
+            echo "| upstream commit | \`${HEAD}\` |"
+            echo "| built by | [run ${GITHUB_RUN_ID}](${run_url}) |"
+            echo "| published | $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M %Z') |"
+            echo
+            echo "## Changes since the previous nightly"
+            echo
+            if [[ -n $previous ]]; then
+              echo "Commits in \`${previous}..${HEAD:0:12}\`:"
+              echo
+              gh api "repos/$GITHUB_REPOSITORY/compare/${previous}...${HEAD}" \
+                --jq '.commits[] | "- `\(.sha[0:7])` \(.commit.message | split("\n")[0])"'
+            else
+              echo "No earlier nightly; the last 15 commits on main:"
+              echo
+              gh api "repos/$GITHUB_REPOSITORY/commits?per_page=15" \
+                --jq '.[] | "- `\(.sha[0:7])` \(.commit.message | split("\n")[0])"'
+            fi
+            echo
+            echo "## Files"
+            echo
+            echo "| file | |"
+            echo "|---|---|"
+            echo "| \`EglantinePS5-v${VERSION}.zip\` | install package; unpack to \`PPSA98515/\` |"
+            echo "| \`SHA256SUMS\` | checksum of the ZIP |"
+            echo
+            echo "Debug symbols are built too but not published; they live for 7 days as the"
+            echo "\`EglantinePS5-symbols\` artifact of the run above."
+            echo
+            echo "## Verify"
+            echo
+            echo '```'
+            echo "shasum -a 256 -c SHA256SUMS"
+            echo "gh attestation verify EglantinePS5-v${VERSION}.zip -R ${GITHUB_REPOSITORY}"
+            echo '```'
+            echo
+            echo "SHA256: \`${digest}\`"
+            if [[ -f dist/release-notes.md ]]; then
+              echo
+              echo "## Upstream release notes"
+              echo
+              cat dist/release-notes.md
+            fi
+          } > "$RUNNER_TEMP/notes.md"
+          echo "Notes written ($(wc -l < "$RUNNER_TEMP/notes.md") lines)."
+
+      - name: Publish the pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+          HEAD: ${{ needs.sync.outputs.main_head }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$HEAD" \
+            --prerelease --title "EglantinePS5 $TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "dist/EglantinePS5-v${VERSION}.zip" dist/SHA256SUMS
+
+      # Keeps the last seven nightlies and deletes the rest with their tags: every build is ~35 MB,
+      # and a month of them is noise nobody downloads.
+      - name: Prune old nightlies
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: '7'
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.tag_name | test("^nightly-[0-9]{8}(\\.[0-9]+)?$")) | "\(.created_at) \(.tag_name)"' \
+            | sort -r | tail -n "+$((KEEP + 1))" | while read -r _ tag; do
+                echo "Deleting $tag"
+                gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+              done
+
+      - name: Summarise
+        if: always()
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+          HEAD: ${{ needs.sync.outputs.main_head }}
+        run: |
+          {
+            echo "### EglantinePS5 $TAG"
+            echo
+            echo "- upstream commit: \`$HEAD\`"
+            echo "- package version: \`$VERSION\`"
+            echo "- release: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          } >> "$GITHUB_STEP_SUMMARY"
