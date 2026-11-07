@@ -141,16 +141,14 @@ jobs:
       - name: Fetch dependencies
         run: make deps
 
-      - name: Restore the RADV driver
-        id: radv
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: |
-            ${{ env.RADV_NATIVE }}/radv-release
-            ${{ env.RADV_NATIVE }}/ps5-payload-sdk
-            ${{ env.RADV_NATIVE }}/zlib
-            build/radv-isolated
-          key: radv-3-${{ hashFiles('tools/deps.json', 'tools/patch-radv-wsi.py', 'tools/build-radv-dependencies.sh', 'tools/isolate-radv.py', 'tools/ci/ubuntu-24.04-packages.txt', 'tools/ci/setup-ubuntu-24.04.sh') }}
+      # RADV is deliberately not cached. release.yml caches the built driver
+      # (mihawk-vulkan-review/.deps/native/radv-release, the payload SDK, zlib, build/radv-isolated)
+      # but not the patched Mesa work tree beside it, .deps/work/radv-src. prepare-build.sh skips
+      # build-radv-dependencies.sh when the cached driver passes its provenance checks, so on a
+      # cache hit that work tree is never created — and Eglantine's NIR backend then fails to
+      # configure on a missing nir.h. Restoring that cache produced exactly that failure here
+      # (run 42363386031). Building RADV costs about six minutes; a nightly that fails unattended
+      # costs the whole night.
 
       # Same key prefix as release.yml: the two workflows hand each other their ccache.
       - name: Restore ccache
@@ -193,17 +191,6 @@ jobs:
         with:
           path: ${{ env.CACHE_ROOT }}/ccache
           key: ccache-u24-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Save the RADV driver
-        if: always() && steps.radv.outputs.cache-hit != 'true' && hashFiles('build/radv-isolated/libvulkan_radeon.ps5.a') != ''
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: |
-            ${{ env.RADV_NATIVE }}/radv-release
-            ${{ env.RADV_NATIVE }}/ps5-payload-sdk
-            ${{ env.RADV_NATIVE }}/zlib
-            build/radv-isolated
-          key: radv-3-${{ hashFiles('tools/deps.json', 'tools/patch-radv-wsi.py', 'tools/build-radv-dependencies.sh', 'tools/isolate-radv.py', 'tools/ci/ubuntu-24.04-packages.txt', 'tools/ci/setup-ubuntu-24.04.sh') }}
 
       # nightly-YYYYMMDD, in Asia/Shanghai. Deliberately not a v* tag: those belong to upstream's
       # versioned releases, and v* is what release.yml builds on. A second release on the same day
