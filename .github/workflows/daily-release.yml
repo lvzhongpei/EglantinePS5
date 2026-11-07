@@ -38,53 +38,39 @@ jobs:
     permissions:
       contents: write
     outputs:
-      changed: ${{ steps.compare.outputs.changed }}
-      main_head: ${{ steps.head.outputs.main_head }}
+      changed: ${{ steps.merge.outputs.changed }}
+      main_head: ${{ steps.merge.outputs.main_head }}
     steps:
-      # behind_by counts the upstream commits this fork's main does not have yet. Comparing commit
-      # SHAs would not do: this workflow's own file is a commit on the fork, so the two tips differ
-      # even when upstream has nothing new.
-      - name: Compare main with upstream
-        id: compare
+      # One call does both the comparison and the merge: merge-upstream answers merge_type "none"
+      # when the fork is level with upstream, and fast-forwards (or merges) when it is not. It reads
+      # the parent relationship recorded on the repository, so it needs no read access to the
+      # upstream repository — which GITHUB_TOKEN, scoped to this repository alone, does not have.
+      # (A cross-repository compare against heydemoura:main returns 404 for that reason.)
+      - name: Merge upstream into main
+        id: merge
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          behind=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$UPSTREAM_REPO:main" --jq .behind_by)
-          echo "behind=$behind" >> "$GITHUB_OUTPUT"
-          echo "Upstream main is $behind commit(s) ahead of this fork."
-          if [[ $behind -gt 0 ]]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          elif [[ ${FORCE:-false} == true ]]; then
-            echo "::notice title=Forced::No new upstream commits; building anyway."
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice title=Up to date::No new upstream commits since the last release."
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Merge upstream into main
-        if: steps.compare.outputs.changed == 'true' && steps.compare.outputs.behind != '0'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # Merges upstream into the fork's main (a fast-forward while the fork has no own commits
-          # past it). A conflict fails the job instead of leaving a half-synced repository.
-          gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=main --jq '"merge: \(.merge_type)"'
-
-      # A step of its own, always run: github.sha still points at the commit this run started from,
-      # and the merge above may have moved main past it (or been skipped entirely under "force").
-      - name: Resolve main HEAD
-        id: head
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
+          # A conflict exits non-zero here, failing the job rather than leaving a half-synced repo.
+          result=$(gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=main)
+          merge_type=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["merge_type"])' <<< "$result")
+          echo "merge_type: $merge_type"
+          # github.sha still points at the commit this run started from, which the merge just moved
+          # past; read the tip back for the build job to check out and for the release's target.
           head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
           echo "main_head=$head" >> "$GITHUB_OUTPUT"
-          echo "main is at $head"
+          if [[ $merge_type != none ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Merged::Upstream brought in ($merge_type)."
+          elif [[ ${FORCE:-false} == true ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Forced::Already level with upstream; building anyway."
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Up to date::Already level with upstream; nothing to build."
+          fi
 
   build:
     name: Build
