@@ -39,7 +39,7 @@ jobs:
       contents: write
     outputs:
       changed: ${{ steps.compare.outputs.changed }}
-      main_head: ${{ steps.merge.outputs.main_head }}
+      main_head: ${{ steps.head.outputs.main_head }}
     steps:
       # behind_by counts the upstream commits this fork's main does not have yet. Comparing commit
       # SHAs would not do: this workflow's own file is a commit on the fork, so the two tips differ
@@ -52,6 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           behind=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$UPSTREAM_REPO:main" --jq .behind_by)
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
           echo "Upstream main is $behind commit(s) ahead of this fork."
           if [[ $behind -gt 0 ]]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -64,7 +65,7 @@ jobs:
           fi
 
       - name: Merge upstream into main
-        id: merge
+        if: steps.compare.outputs.changed == 'true' && steps.compare.outputs.behind != '0'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -72,10 +73,18 @@ jobs:
           # Merges upstream into the fork's main (a fast-forward while the fork has no own commits
           # past it). A conflict fails the job instead of leaving a half-synced repository.
           gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=main --jq '"merge: \(.merge_type)"'
-          # Read back the new tip: github.sha still points at the commit this run started from.
+
+      # A step of its own, always run: github.sha still points at the commit this run started from,
+      # and the merge above may have moved main past it (or been skipped entirely under "force").
+      - name: Resolve main HEAD
+        id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
           head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
           echo "main_head=$head" >> "$GITHUB_OUTPUT"
-          echo "main is now $head"
+          echo "main is at $head"
 
   build:
     name: Build
