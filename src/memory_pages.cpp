@@ -24,6 +24,18 @@
 #include <vector>
 
 #include "fastmem.h"
+// Linked in the app (common, lz4); absent in the host checks that build this file alone.
+// The driver gives back device memory no bound resource uses (tools/patch-radv-trim.py; the RADV
+// archive's symbols carry the isolation prefix). Absent in the host checks and other drivers.
+extern "C" [[gnu::weak]] std::uint64_t eden_radv_private_radv_ps5_eden_trim(std::uint64_t want);
+extern "C" {
+[[gnu::weak]] int LZ4_compress_default(const char* source, char* dest, int source_size, int max_dest_size);
+[[gnu::weak]] int LZ4_decompress_safe(const char* source, char* dest, int compressed_size, int max_decompressed_size);
+[[gnu::weak]] int LZ4_compressBound(int input_size);
+}
+namespace Common::Compression {
+[[gnu::weak]] std::vector<std::uint8_t> CompressDataLZ4(const std::uint8_t* source, std::size_t source_size);
+}
 
 #ifdef PS5_NATIVE
 // Keep CPU heaps/tables and JIT views out of RADV's high-word-2 GPU window.
@@ -277,6 +289,9 @@ struct SparseRange {
     bool promote = false;               // writes to shared slots are promoted (the service runs)
     std::uint16_t* fine = nullptr;      // per slot: 16 KiB pages a Fine slot keeps (low 8 bits), times made whole (bits 8-11)
     std::uint32_t* fine_after = nullptr; // per slot: the scan pass from which it may be made Fine again
+    // Guest range only: per slot, the 64-bit fastmem window's regions that show its block
+    // (guest_memory_service.inc, AliasesPerSlot entries each; src/host_memory.cpp, Window64).
+    std::uintptr_t* aliases = nullptr;
 };
 std::array<SparseRange, 64> sparse_ranges;
 std::mutex sparse_mutex;
@@ -393,6 +408,8 @@ void ReleaseSparse(SparseRange& range) {
     range.fine = nullptr;
     delete[] range.fine_after;
     range.fine_after = nullptr;
+    delete[] range.aliases;
+    range.aliases = nullptr;
     range.begin.store(0, std::memory_order_release);
     delete[] range.owned;
     delete[] range.physical;

@@ -63,6 +63,7 @@ extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
 #include "native_directory.h"
 #include "extracted_game.h"
 #include "cache_budget.h"
+#include "guest_clock.h"
 #include "performance.h"
 #include "crash_site.h"
 #include "core/memory.h"
@@ -73,6 +74,10 @@ extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
 #include "stall_watchdog.h"
 #include "dev_vulkan.h"
 #include "../src/fastmem.h"
+// The 64-bit fastmem window's demoted sites, kept per title (headless/dynarmic/fastmem-callback.cmake).
+extern "C" std::size_t eden_fastmem64_load_sites(const char*, unsigned long long, const unsigned char*) __attribute__((weak));
+extern "C" std::size_t eden_fastmem64_save_sites(const char*, unsigned long long, unsigned long long,
+                                                 const unsigned char*) __attribute__((weak));
 #include "crash_report.h"
 #include "eglantineps5/frontend.h"
 #include "eglantineps5/version.h"
@@ -127,8 +132,14 @@ extern "C" bool eden_jit_shared;  // headless/dynarmic/jit_group_support.inc
 #endif
 #include "profiles.h"
 #include "stop_limit.h"
+#include "core/device_memory.h"
+#include "core/hle/kernel/k_memory_layout.h"
+#include "core/hle/kernel/k_memory_manager.h"
+#include "core/hle/kernel/kernel.h"
 namespace Common {
 bool SparseTablesAvailable() noexcept; // src/memory_pages.cpp
+void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept;
+std::size_t GuestMemoryHeldIn(std::uint64_t offset, std::size_t bytes) noexcept;
 }
 #if defined(EDEN_DEV_PROFILE) || defined(EDEN_DEV_ROM_ID)
 static bool dev_stop_hang = false; // dev-settings stop_hang=on
@@ -542,6 +553,9 @@ int main(int argc, char** argv) {
                                           std::pair{"EDEN_PS5_WORKER_SPIN_US", "300"}}) {
             setenv(name, value, 0);
         }
+        // The 64-bit fastmem window (src/host_memory.cpp, Window64): opt-in while it is qualified,
+        // EDEN_FASTMEM64=1. Chosen here, before Core::System (and so HostMemory) is made.
+        if (const char* window64 = std::getenv("EDEN_FASTMEM64")) Eden::Fastmem::RequestA64(window64[0] == '1');
 #ifdef EDEN_MKW_DIAGNOSTICS
         // Temporary capture for the Mario Kart World loading-screen investigation.
         const auto diagnostic_capture_dir = Eden::LogFile("mkw-gpfifo-" + std::to_string(getpid()));
@@ -665,8 +679,14 @@ int main(int argc, char** argv) {
         launch_error.clear();
         if (!rooms.BeginGame()) throw std::runtime_error("Join a room successfully or leave it before starting a game.");
         SCOPE_EXIT { rooms.EndGame(); };
+#if defined(EDEN_DEV_PROFILE) || defined(EDEN_MKW_DIAGNOSTICS)
+        // The timers these builds' reports read (EDEN_DEV_ lines, EDEN_GUEST_RUN, the MKW timers);
+        // off elsewhere, where a Timer is one look at the flag (performance.h timers_on).
+        Eden::Performance::timers_on = true;
+#endif
 #ifdef EDEN_DEV_VULKAN
         Eden::Performance::vulkan_cost_enabled = std::filesystem::exists(Eden::AppFile("cost-run.txt"));
+        if (Eden::Performance::vulkan_cost_enabled) Eden::Performance::timers_on = true;  // a cost run
         const bool performance_run = std::filesystem::exists(Eden::AppFile("performance-run.txt"));
 #ifdef EDEN_DEV_PROFILE
         Eden::Performance::texture_budget_log = true;  // EDEN_VULKAN_TEXTURE_BUDGET every 300 frames
@@ -815,8 +835,8 @@ int main(int argc, char** argv) {
         #ifdef EDEN_PS5_OPENGL
         Settings::values.renderer_backend = backend == Eden::GraphicsBackend::Vulkan ?
             Settings::RendererBackend::Vulkan : Settings::RendererBackend::OpenGL_GLSL;
-        // Keep emulator threads off guest cores 0-2 and their SMT siblings (Vulkan):
-        // +17% in the heaviest measured window of a racing game.
+        // Keep emulator threads off the pinned guest-core and GPU CPUs and the GPU thread's SMT
+        // sibling (Vulkan; performance.cpp CheckWorkerTopology).
         Eden::Performance::SetSecondaryPlacement(backend == Eden::GraphicsBackend::Vulkan);
         // A32 fastmem window (direct JIT accesses to aliased guest memory): opt-in with dev-settings
         // fastmem=on; on the console it is slower than the page-table path.
@@ -852,6 +872,8 @@ int main(int argc, char** argv) {
         Settings::values.memory_layout_mode = Settings::MemoryLayout::Memory_4Gb;
         // A development run that names jit_list in dev-settings decides the block list by itself.
         [[maybe_unused]] bool dev_block_list = false;  // read where a session applies its settings
+        [[maybe_unused]] bool dev_astc_cpu = false;   // dev-settings astc=cpu
+        [[maybe_unused]] bool dev_astc_full = false;  // dev-settings astc_textures=full
 #ifdef EDEN_DEV_PROFILE
         // One-run A/B switches written by the development runner; absent = defaults.
         {
@@ -866,9 +888,28 @@ int main(int argc, char** argv) {
                 } else if (entry.starts_with("cache_spin=")) {
                     // try_lock retries before a guest core sleeps on a GPU cache lock (0 = upstream).
                     Eden::Performance::cache_lock_spins = static_cast<unsigned>(std::strtoul(entry.c_str() + 11, nullptr, 10));
+                } else if (entry.starts_with("cpu_write_ahead=")) {
+                    // Buffer pages after a tracked write marked CPU-modified with it (performance.h).
+                    Eden::Performance::cpu_write_ahead = static_cast<unsigned>(std::min(256UL, std::strtoul(entry.c_str() + 16, nullptr, 10)));
+                } else if (entry == "cpu_write_defer=off") {
+                    // Guest writes wait for a GPU cache lock the GPU thread holds, as upstream (performance.h).
+                    Eden::Performance::cpu_write_defer = false;
+                } else if (entry == "cpu_read_skip=on") {
+                    // Reads skip the download check while a guest write holds the texture cache lock.
+                    Eden::Performance::cpu_read_skip = true;
+                } else if (entry == "dma_batch=off") {
+                    // One engine call per GPU command word, as upstream (performance.h dma_batch).
+                    Eden::Performance::dma_batch = false;
+                    std::printf("EDEN_DEV_DMA_BATCH 0\n");
+                } else if (entry == "timers=off") {
+                    // No Timer counts (EDEN_DEV_ lines read 0): what the timers cost a development build.
+                    Eden::Performance::timers_on = false;
                 } else if (entry == "gc_dirty=upstream") {
                     // Eden's rule: evict GPU-written textures from the "expected" memory mark on.
                     Eden::Performance::gc_keep_dirty = false;
+                } else if (entry == "gc_scan=upstream") {
+                    // Eden's rule: the collector's budget counts visits, not evictions.
+                    Eden::Performance::gc_count_visits = true;
                 } else if (entry.starts_with("dispatch_draws=")) {
                     // Draws between Vulkan worker hand-offs: a power of two from 8 (upstream) to 512.
                     const unsigned long draws = std::strtoul(entry.c_str() + 15, nullptr, 10);
@@ -877,6 +918,26 @@ int main(int argc, char** argv) {
                 } else if (entry.starts_with("idle_spin_us=")) {
                     // Guest cores spin this long on their interrupt flag before sleeping (W1).
                     Eden::Performance::idle_spin_iterations = static_cast<unsigned>(std::stoul(entry.substr(13)) * 50);
+                } else if (entry == "guest_clock=off") {
+                    // The guest tick counter keeps the clock's rate when frames are late (guest_clock.h).
+                    Eden::GuestClock::enabled = false;
+                } else if (entry.starts_with("compose_delay_us=")) {
+                    // Guest vsync signalled first, composition N us later (VI conductor; 0 = upstream).
+                    Eden::Performance::compose_delay_us = std::stoi(entry.substr(17));
+                } else if (entry.starts_with("kspin=")) {
+                    // PAUSEs a contended guest kernel spin lock spins before it sleeps (Eglantine's
+                    // KSpinLock, EDEN_PS5_KSPIN; 2048 by default). Read at the first contended lock.
+                    setenv("EDEN_PS5_KSPIN", entry.substr(6).c_str(), 1);
+                } else if (entry.starts_with("pin=") && entry.find(':') != std::string::npos) {
+                    // A secondary thread on one CPU: pin=GPUBack:12 (performance.cpp PlaceSecondary).
+                    const auto colon = entry.find(':');
+                    setenv(("EDEN_PIN_" + entry.substr(4, colon - 4)).c_str(), entry.substr(colon + 1).c_str(), 1);
+                } else if (entry.starts_with("back_cpu=")) {
+                    // The split GPU thread's back pinned to this CPU (performance.cpp PlaceSecondary).
+                    setenv("EDEN_BACK_CPU", entry.substr(9).c_str(), 1);
+                } else if (entry.starts_with("secondary_mask=")) {
+                    // The CPUs secondary threads share, in hex (performance.cpp PlaceSecondary).
+                    setenv("EDEN_SECONDARY_MASK", entry.substr(15).c_str(), 1);
                 } else if (entry.starts_with("pc_core=") && entry.size() == 9 && entry[8] >= '0' && entry[8] <= '3') {
                     // Host PC samples from this guest core instead of core 0 (with --pc-sample).
                     Eden::Performance::pc_sample_core = static_cast<unsigned>(entry[8] - '0');
@@ -924,6 +985,8 @@ int main(int argc, char** argv) {
                     Eden::DevVulkan::robustness2 = true;
                 } else if (entry == "vertex_input_dynamic=off") {
                     Settings::values.vertex_input_dynamic_state.SetValue(false);
+                } else if (entry == "static_vi=off") {
+                    Eden::DevVulkan::static_vertex_input = false;
                 } else if (entry == "pipeline_trace=on") {
                     Eden::DevVulkan::trace_pipelines = true;
                 } else if (entry.starts_with("radv_debug=")) {
@@ -954,8 +1017,21 @@ int main(int argc, char** argv) {
                     Eden::DevVulkan::gpu_time = true;
                 } else if (entry == "submit_sync=on") {
                     Eden::DevVulkan::sync_submissions = true;
+                } else if (entry == "astc=gpu") {
+                    // The default (ASTC decoded on the GPU); kept so older run settings still parse.
                 } else if (entry == "astc=cpu") {
-                    Settings::values.accelerate_astc.SetValue(Settings::AstcDecodeMode::Cpu);
+                    // ASTC decoded on the CPU in the draw that uploads it (to compare with the GPU path).
+                    dev_astc_cpu = true;
+                } else if (entry == "astc_textures=full") {
+                    // ASTC decoded at full quality instead of kept as BC3 (see the video settings below).
+                    dev_astc_full = true;
+                } else if (entry == "tex_partial=off") {
+                    // The core's own partial texture refresh bound (16 MiB) instead of 1 MiB (texture_partial.h).
+                    Eden::Performance::tex_partial = false;
+                } else if (entry == "tex_partial_check=on") {
+                    Eden::Performance::tex_partial_check = true;
+                } else if (entry.starts_with("tex_partial_kb=")) {
+                    Eden::Performance::tex_partial_min = std::strtoull(entry.c_str() + 15, nullptr, 10) << 10;
                 } else if (entry == "log=render") {
                     // Renderer debug logging for crash probes (fetched every few seconds).
                     Common::Log::Filter filter;
@@ -1046,6 +1122,25 @@ int main(int argc, char** argv) {
             Settings::values.resolution_setup.SetValue(resolutions[resolution]);
             Settings::values.scaling_filter.SetValue(filters[filter]);
             Settings::UpdateRescalingInfo();
+            // ASTC textures are kept as BC3 (ProsperoEden). The console's GPU has no ASTC, so Eden
+            // holds such a texture decoded, at four bytes a pixel; BC3 takes one. A large open-world
+            // game has two texture arrays of 121 layers in that format: 816 MiB decoded, 204 MiB as
+            // BC3. At 2x, where every render target also has a copy four times its size, that was the
+            // memory a session ran out of within a minute of play, and with BC3 it did not; the GPU
+            // thread's time for a frame was the same either way. At 1x it took longer and ended the
+            // same way. So at every resolution, and for Switch 1 titles too (the core already picks BC3
+            // for a Switch 2 title on a GPU with less than a 12 GiB budget). dev-settings
+            // astc_textures=full keeps them decoded.
+            Settings::values.astc_recompression.SetValue(dev_astc_full ? Settings::AstcRecompression::Uncompressed
+                                                                       : Settings::AstcRecompression::Bc3);
+            // Kept as BC3, a texture decoded on the CPU is decoded inside the draw that first uses it,
+            // with both GPU caches locked: 130 to 290 ms for a draw, three seconds for a texture array
+            // of 121 layers. On another thread (CpuAsynchronous) no frame waits, but the texture is
+            // black or missing until it lands. So the GPU decodes it (and compresses it to BC1/BC3 on
+            // Vulkan) in the frame that uploads it: no such waits, the same frame rate and worst
+            // frames (ProsperoEden runs/astc-*, 2026-11-02). dev-settings astc=cpu decodes on the CPU.
+            Settings::values.accelerate_astc.SetValue(dev_astc_cpu ? Settings::AstcDecodeMode::Cpu
+                                                                   : Settings::AstcDecodeMode::Gpu);
 #ifdef EDEN_PS5_FRAMEGEN
             // Lossless Scaling frame generation (EDEN_PS5_FRAMEGEN, headless/vulkan.cmake).
             // Settings > Video's switch, or the game's own in Library > Triangle > Video, asks
@@ -1594,6 +1689,9 @@ int main(int argc, char** argv) {
                 // The blocks this game compiled in earlier sessions, compiled ahead on a spare CPU.
                 if (std::filesystem::exists(Eden::AppFile("block-list.txt"))) Eden::JitList::enabled = true;
                 Eden::JitList::Session jit_list;
+                [[maybe_unused]] std::string fastmem64_sites;  // the title's demoted 64-bit fastmem sites (cache/jit)
+                [[maybe_unused]] u64 fastmem64_code_start = 0, fastmem64_code_size = 0;
+                [[maybe_unused]] unsigned char fastmem64_build[32]{};
                 if (auto* process = system.ApplicationProcess()) {
                     Eden::JitList::BuildId build{};
                     const auto& id = system.GetApplicationProcessBuildID();
@@ -1610,6 +1708,22 @@ int main(int argc, char** argv) {
                         code_end = info.m_address + info.m_size;
                     }
                     jit_list.Start(system.GetApplicationProcessProgramID(), build, code_start, code_end - code_start);
+#ifdef PS5_NATIVE
+                    // The 64-bit fastmem window's demoted sites from earlier sessions (fastmem-callback.cmake).
+                    if (Eden::Fastmem::Window64Base() != 0 && eden_fastmem64_load_sites) {
+                        char name[64];
+                        std::snprintf(name, sizeof(name), "/cache/jit/%016llX.fastmem64-sites",
+                                      static_cast<unsigned long long>(system.GetApplicationProcessProgramID()));
+                        (void)mkdir((Eden::UserDir() + "/cache").c_str(), 0777);
+                        (void)mkdir((Eden::UserDir() + "/cache/jit").c_str(), 0777);
+                        fastmem64_sites = Eden::UserDir() + name;
+                        fastmem64_code_start = code_start;
+                        fastmem64_code_size = code_end - code_start;
+                        std::memcpy(fastmem64_build, build.data(), std::min(sizeof(fastmem64_build), build.size()));
+                        std::printf("EDEN_FASTMEM64 sites_loaded=%zu\n",
+                                    eden_fastmem64_load_sites(fastmem64_sites.c_str(), fastmem64_code_start, fastmem64_build));
+                    }
+#endif
                 }
                 Eden::TakeGuestFault(); // Nothing from an earlier session belongs to this one.
                 Eden::Loading::Set(Eden::Loading::Step::starting);
@@ -1621,6 +1735,40 @@ int main(int argc, char** argv) {
                     if (!running || !running->IsPoweredOn()) return 0;
                     auto* const process = running->ApplicationProcess();
                     return process ? process->GetUsedUserPhysicalMemorySize(running->Kernel()) : 0;
+                });
+                Eden::Performance::guest_pool_report.store([] {
+                    auto* const running = reporting_system;
+                    if (!running || !running->IsPoweredOn()) return;
+                    auto& kernel = running->Kernel();
+                    struct PoolRegion { const char* name; u32 type; };
+                    static constexpr PoolRegion pools[] = {
+                        {"application", static_cast<u32>(Kernel::KMemoryRegionType_DramApplicationPool.GetValue())},
+                        {"applet", static_cast<u32>(Kernel::KMemoryRegionType_DramAppletPool.GetValue())},
+                        {"system_nonsecure", static_cast<u32>(Kernel::KMemoryRegionType_DramSystemNonSecurePool.GetValue())},
+                        {"system", static_cast<u32>(Kernel::KMemoryRegionType_DramSystemPool.GetValue())},
+                    };
+                    char line[512];
+                    int length = std::snprintf(line, sizeof(line), "EDEN_GUEST_POOLS");
+                    std::size_t outside = 0;
+                    for (const auto& pool : pools) {
+                        std::size_t held = 0, span = 0;
+                        for (const auto& region : kernel.MemoryLayout().GetPhysicalMemoryRegionTree()) {
+                            if (!region.IsDerivedFrom(pool.type)) continue;
+                            span += region.GetSize();
+                            held += ::Common::GuestMemoryHeldIn(region.GetAddress() - Core::DramMemoryMap::Base, region.GetSize());
+                        }
+                        // (Not the kernel's free size: its pool lock needs a guest thread.)
+                        outside += held;
+                        if (length > 0 && static_cast<std::size_t>(length) < sizeof(line))
+                            length += std::snprintf(line + length, sizeof(line) - length, " %s=held:%zu/span:%zu",
+                                                    pool.name, held >> 20, span >> 20);
+                    }
+                    std::size_t guest_span = 0, guest_held = 0;
+                    ::Common::GuestMemoryUsage(&guest_span, &guest_held);
+                    if (length > 0 && static_cast<std::size_t>(length) < sizeof(line))
+                        std::snprintf(line + length, sizeof(line) - length, " other_held=%zu (MiB)\n",
+                                      (guest_held > outside ? guest_held - outside : 0) >> 20);
+                    std::fputs(line, stderr);
                 });
                 system.Run();
 #if defined(EDEN_DEV_PROFILE) && defined(PS5_NATIVE)
@@ -1978,6 +2126,12 @@ int main(int argc, char** argv) {
                 // A game that ended itself or failed is being stopped too (stop_limit.h).
                 Eden::StopLimit::Begin();
                 jit_list.Finish();  // while the JITs still exist: their block list is saved
+#ifdef PS5_NATIVE
+                if (!fastmem64_sites.empty() && eden_fastmem64_save_sites)
+                    std::printf("EDEN_FASTMEM64 sites_saved=%zu\n",
+                                eden_fastmem64_save_sites(fastmem64_sites.c_str(), fastmem64_code_start,
+                                                          fastmem64_code_size, fastmem64_build));
+#endif
                 // Shutdown requests cancellation before suspending cores; Pause can
                 // block while a CPU producer is waiting on a full GPU queue.
                 Eden::ReportStep("shutdown", "Stopping the game");

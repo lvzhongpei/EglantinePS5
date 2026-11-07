@@ -5,10 +5,13 @@
 // page must take the callback path. The lookup replaces each access's location argument (only
 // read with check_halt_on_memory_access, which keeps this pass off).
 extern "C" {
-// Opt-in while it is qualified: EDEN_JIT_PAGE_REUSE=1 (env.txt, read at the first compiled block,
-// after the app applies env.txt), or set directly by tests. Backported from ProsperoEden
+// On by default (with the direct table); EDEN_JIT_PAGE_REUSE=0 (env.txt, read at the first compiled
+// block, after the app applies env.txt) turns it off. Tests set eden_page_reuse directly. Backported from ProsperoEden
 // (GPL-3.0-or-later).
-bool eden_page_reuse = false;
+bool eden_page_reuse = true;
+// A site the 64-bit fastmem window's fault took off fastmem (headless/dynarmic/fastmem-callback.cmake):
+// keyed by the block's location and the access's IR name. Null without that unit.
+bool eden_fastmem64_site_demoted(unsigned long long location, unsigned inst) __attribute__((weak));
 int eden_page_reuse_env = -1;
 // Groups formed and the accesses they hold, counted while blocks are compiled.
 unsigned long long eden_page_reuse_groups = 0;
@@ -104,15 +107,18 @@ bool EdenEndsGroups(IR::Opcode op) {
 static void EdenPageReusePass(IR::Block& block, const A64::UserConfig& conf) {
     // The emitted lookup reads the direct table: absolute offsets, no attributes, 8-byte
     // entries, an address space that is range-checked (not mirrored) and fits 32 index bits.
-    // Not with a fastmem window: its accesses do not read the page table.
-    if (conf.fastmem_pointer.has_value()) {
+    // With a fastmem window only the accesses that stay on the page table are grouped: the sites a
+    // window fault demoted (the saved list makes most of them known from the start). Keeping the
+    // pass off there left every such access its full lookup.
+    const bool window = conf.fastmem_pointer.has_value();
+    if (window && !eden_fastmem64_site_demoted) {
         return;
     }
     if (eden_page_reuse_env < 0) {
         const char* option = std::getenv("EDEN_JIT_PAGE_REUSE");
-        eden_page_reuse_env = option != nullptr && option[0] == '1';
+        eden_page_reuse_env = option != nullptr && option[0] == '0' ? 0 : 1;
     }
-    if (!(eden_page_reuse || eden_page_reuse_env == 1) || !conf.page_table || conf.check_halt_on_memory_access ||
+    if (!eden_page_reuse || eden_page_reuse_env == 0 || !conf.page_table || conf.check_halt_on_memory_access ||
         !conf.absolute_offset_page_table || conf.page_table_pointer_mask != 0 || conf.page_table_marked_bit ||
         conf.page_table_sign_extension || conf.silently_mirror_page_table || conf.page_table_log2_stride != 3 ||
         conf.page_table_address_space_bits <= 12 || conf.page_table_address_space_bits > 42 ||
@@ -152,6 +158,9 @@ static void EdenPageReusePass(IR::Block& block, const A64::UserConfig& conf) {
         }
         const auto address = EdenDecomposeAddress(inst.GetArg(1));
         if (!address) {
+            continue;
+        }
+        if (window && !eden_fastmem64_site_demoted(block.Location().Value(), inst.GetName())) {
             continue;
         }
         const s64 end = address->offset + static_cast<s64>(bytes);
