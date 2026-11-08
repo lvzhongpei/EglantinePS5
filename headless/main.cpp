@@ -636,7 +636,7 @@ int main(int argc, char** argv) {
             for (const auto& entry : Eden::ReadNativeDirectory(folder, rom_error)) {
                 const auto filename = entry.path().filename().string();
                 const auto extension = entry.path().extension();
-                if (extension != ".nsp" && extension != ".xci") continue;
+                if (extension != ".nsp" && extension != ".xci" && extension != ".nup") continue;
                 const auto path = folder + "/" + filename;
                 if (filename.find(development_id) != std::string::npos ||
                     eden_game_title_id(path.c_str()) == development_title) {
@@ -1117,6 +1117,9 @@ int main(int argc, char** argv) {
             static_assert(std::size(filters) == std::size(Eden::kUpscalingFilterKeys));
             // Settings > Video, with what the game does differently (Library > Game settings > Video).
             const auto video = Eden::PreferencesFor(eden_game_title_id(guest));
+            // Settings > Video > Skip game anti-aliasing (video_core/oot_network.h): read by the core
+            // at each dispatch of a game's network.
+            setenv("EDEN_OOT_ANTI_ALIASING", video.skip_game_aa ? "skip" : "game", 1);
             const int resolution = video.resolution;
             const int filter = video.upscaling_filter;
             Settings::values.resolution_setup.SetValue(resolutions[resolution]);
@@ -1264,21 +1267,6 @@ int main(int argc, char** argv) {
             // Mods): Eden's patch manager skips the names in this list. With the Library's Mods
             // switch off for the game, every one of them is in it.
             const u64 title = eden_game_title_id(guest);
-            {
-                // Donkey Kong Bananza's update needs its HMMA compute shaders expanded in software
-                // (patch 0009); other titles keep skipping them, as Mario Kart World's frame rate
-                // was measured. A value from env.txt wins.
-                static bool soft_hmma_by_port = false;
-                if (title == 0x040074A01BF12000ULL) {
-                    if (std::getenv("EDEN_NX2_SOFT_HMMA") == nullptr) {
-                        setenv("EDEN_NX2_SOFT_HMMA", "1", 1);
-                        soft_hmma_by_port = true;
-                    }
-                } else if (soft_hmma_by_port) {
-                    unsetenv("EDEN_NX2_SOFT_HMMA");
-                    soft_hmma_by_port = false;
-                }
-            }
             const auto all_mods = Eden::Mods::List(Eden::AssetsPath("mods"), title);
             auto mods_off = Eden::LoadDisabledMods(title);
             if (!Eden::LoadModsEnabled(title)) {
@@ -1370,7 +1358,8 @@ int main(int argc, char** argv) {
             const auto controls = Eden::PreferencesFor(game_title);
             Settings::values.vibration_enabled.SetValue(controls.vibration);
             pad->SetMapping(controls.mapping);
-            Eden::Report("launch", (std::string("Controls: vibration ") + (controls.vibration ? "on" : "off") +
+            Eden::Report("launch", (std::string("Controls: vibration ") +
+                                    (controls.vibration ? std::to_string(controls.vibration_strength) + "%" : "off") +
                                     ", buttons " + (controls.mapping == Eden::kDefaultMapping ? std::string("as usual") :
                                     Eden::Settings::MappingJson(controls.mapping).dump())).c_str());
             // One Pro Controller per signed-in user's DualSense; later changes apply mid-game.
@@ -1386,16 +1375,17 @@ int main(int argc, char** argv) {
                 player.connected = handheld ? false : index == 0 || (connected & (1u << index)) != 0;
                 player.controller_type = handheld ? Settings::ControllerType::ProController :
                                                     Eden::ControllerSetting(controls.controller);
-                // DualSense rumble (headless/pad.cpp) at Eden's full strength.
+                // DualSense rumble (headless/pad.cpp) at the strength of Settings > Controls: Eden
+                // scales what the game asks for by it (emulated_controller.cpp).
                 player.vibration_enabled = true;
-                player.vibration_strength = 100;
+                player.vibration_strength = controls.vibration_strength;
             }
             {
                 auto& player = Settings::values.players.GetValue()[8];  // Eden's handheld controller
                 player.connected = handheld;
                 player.controller_type = Settings::ControllerType::Handheld;
                 player.vibration_enabled = true;
-                player.vibration_strength = 100;
+                player.vibration_strength = controls.vibration_strength;
             }
             if (controls.controller >= 0)
                 Eden::Report("launch", (std::string("Controller type: ") +

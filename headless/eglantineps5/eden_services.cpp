@@ -1076,7 +1076,7 @@ std::vector<pe::ui::Game> EdenServices::games() {
         std::string format = file.substr(dot + 1);
         std::transform(format.begin(), format.end(), format.begin(),
                        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-        if (format != "NSP" && format != "XCI" && format != "DIR") continue;
+        if (format != "NSP" && format != "XCI" && format != "NUP" && format != "DIR") continue;
         const std::string path = RomPath(file);
         struct stat info {};
         if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) continue;
@@ -1270,6 +1270,10 @@ bool EdenServices::set_docked(std::uint64_t title_id, bool docked) {
 static_assert(pe::ui::kGameButtons == Eden::kGameButtons && pe::ui::kPadButtons == Eden::kPadButtons &&
               pe::ui::kDefaultMapping == Eden::kDefaultMapping, "the launcher's button mapping differs");
 static_assert(std::tuple_size_v<decltype(pe::ui::GameSettings::performance)> == Eden::kPerformanceSwitches);
+// The launcher's overlay rows walk the field bits in order and its sizes and corners by index.
+static_assert(pe::ui::Preferences{}.hud_fields == static_cast<int>(Eden::kHudFieldDefault) &&
+              Eden::kHudFieldCount == 8 && Eden::kHudSizes == 3 && Eden::kHudCorners == 4,
+              "the launcher's FPS overlay options differ");
 
 pe::ui::GameSettings EdenServices::game_settings(std::uint64_t title_id) {
     const Eden::GameSettings saved = Eden::LoadGameSettings(title_id);
@@ -1324,6 +1328,9 @@ pe::ui::Preferences EdenServices::preferences() {
     const Eden::Preferences saved = Eden::LoadPreferences();
     pe::ui::Preferences result;
     result.hud = saved.hud;
+    result.hud_fields = saved.hud_fields;
+    result.hud_size = saved.hud_size;
+    result.hud_corner = saved.hud_corner;
     result.volume = saved.volume;
     result.mute = saved.mute;
     result.detailed_logging = saved.detailed_logging;
@@ -1334,15 +1341,19 @@ pe::ui::Preferences EdenServices::preferences() {
     result.refresh = saved.refresh;
     result.output = saved.output;
     result.frame_gen = saved.frame_gen;
+    result.skip_game_aa = saved.skip_game_aa;
     result.frame_gen_type = saved.frame_gen_type;
     result.frame_gen_target = saved.frame_gen_target;
     result.frame_gen_multiplier = saved.frame_gen_multiplier;
     result.vibration = saved.vibration;
+    result.vibration_strength = saved.vibration_strength;
     result.language = saved.language;
     result.menu_volume = saved.menu_volume;
     result.large_text = saved.large_text;
     result.high_contrast = saved.high_contrast;
     result.reduce_motion = saved.reduce_motion;
+    result.theme = saved.theme;
+    result.accent = saved.accent;
     // Settings > Performance: the general values (settings_store.h).
     const Eden::PerformanceSettings speed = Eden::LoadPerformance(0);
     result.block_list = speed.block_list;
@@ -1359,6 +1370,9 @@ pe::ui::Preferences EdenServices::preferences() {
 bool EdenServices::set_preferences(const pe::ui::Preferences& preferences) {
     Eden::Preferences value;
     value.hud = preferences.hud;
+    value.hud_fields = preferences.hud_fields;
+    value.hud_size = preferences.hud_size;
+    value.hud_corner = preferences.hud_corner;
     value.volume = preferences.volume;
     value.mute = preferences.mute;
     value.detailed_logging = preferences.detailed_logging;
@@ -1369,15 +1383,19 @@ bool EdenServices::set_preferences(const pe::ui::Preferences& preferences) {
     value.refresh = preferences.refresh;
     value.output = preferences.output;
     value.frame_gen = preferences.frame_gen;
+    value.skip_game_aa = preferences.skip_game_aa;
     value.frame_gen_type = preferences.frame_gen_type;
     value.frame_gen_target = preferences.frame_gen_target;
     value.frame_gen_multiplier = preferences.frame_gen_multiplier;
     value.vibration = preferences.vibration;
+    value.vibration_strength = preferences.vibration_strength;
     value.language = preferences.language;
     value.menu_volume = preferences.menu_volume;
     value.large_text = preferences.large_text;
     value.high_contrast = preferences.high_contrast;
     value.reduce_motion = preferences.reduce_motion;
+    value.theme = preferences.theme;
+    value.accent = preferences.accent;
     value.mapping = preferences.mapping;
     Eden::PerformanceSettings speed = Eden::LoadPerformance(0);
     speed.block_list = preferences.block_list;
@@ -1445,7 +1463,7 @@ pe::ui::FolderInfo EdenServices::folder_info(const std::string& directory) {
     pe::ui::FolderInfo info;
     info.keys = Eden::FileExists(JoinPath(directory, "keys/prod.keys"));
     info.firmware = CountFiles(JoinPath(directory, "firmware"), {".nca"});
-    info.games = CountFiles(JoinPath(directory, "roms"), {".nsp", ".xci"});
+    info.games = CountFiles(JoinPath(directory, "roms"), {".nsp", ".xci", ".nup"});
     return info;
 }
 

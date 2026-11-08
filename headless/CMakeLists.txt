@@ -2129,7 +2129,8 @@ get_target_property(npad_sources hid_core SOURCES)
 list(FILTER npad_sources EXCLUDE REGEX "(^|/)npad\\.cpp$")
 list(APPEND npad_sources "${PORT_BUILD_DIR}/npad.cpp")
 set_property(TARGET hid_core PROPERTY SOURCES "${npad_sources}")
-add_library(eden-pad STATIC "${EDEN_PORT_DIR}/pad.cpp"
+# pad_haptics.cpp: HD rumble through the DualSense audio haptics (sceAudioOut vibration port).
+add_library(eden-pad STATIC "${EDEN_PORT_DIR}/pad.cpp" "${EDEN_PORT_DIR}/pad_haptics.cpp"
     "${PROJECT_SOURCE_DIR}/src/input_common/input_engine.cpp"
     "${PROJECT_SOURCE_DIR}/src/input_common/input_poller.cpp"
     "${PROJECT_SOURCE_DIR}/src/input_common/drivers/virtual_gamepad.cpp")
@@ -2167,7 +2168,8 @@ list(REMOVE_ITEM audio_sources sink/sink_details.cpp sink/sink_stream.cpp render
 list(APPEND audio_sources "${PORT_BUILD_DIR}/sink_details.cpp" "${PORT_BUILD_DIR}/sink_stream.cpp" "${PORT_BUILD_DIR}/voice_info.cpp")
 set_property(TARGET audio_core PROPERTY SOURCES "${audio_sources}")
 if(PS5_NATIVE)
-    target_link_libraries(eden-pad PUBLIC "${sdk}/target/lib/libScePad.so" "${sdk}/target/lib/libSceUserService.so")
+    target_link_libraries(eden-pad PUBLIC "${sdk}/target/lib/libScePad.so" "${sdk}/target/lib/libSceUserService.so"
+        "${sdk}/target/lib/libSceAudioOut.so")
     target_link_libraries(audio_core PUBLIC "${sdk}/target/lib/libSceAudioOut.so")
 else()
     add_library(eden-device-mock STATIC "${EDEN_PORT_DIR}/mock_devices.cpp")
@@ -2994,6 +2996,10 @@ else()
     target_include_directories(eden-shader-cache-check PRIVATE "${PROJECT_SOURCE_DIR}/src")
     target_link_libraries(eden-shader-cache-check PRIVATE video_core)
     target_compile_options(eden-shader-cache-check PRIVATE -fno-rtti)
+    add_executable(eden-nup-check "${EDEN_PORT_DIR}/nup_check.cpp")
+    target_include_directories(eden-nup-check PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    target_link_libraries(eden-nup-check PRIVATE core)
+    target_compile_options(eden-nup-check PRIVATE -fno-rtti)
     add_executable(eden-mods-check "${EDEN_PORT_DIR}/mods_check.cpp")
     target_include_directories(eden-mods-check PRIVATE "${PROJECT_SOURCE_DIR}/src")
     target_link_libraries(eden-mods-check PRIVATE core)
@@ -3203,6 +3209,7 @@ endif()
                 "${launcher_dir}/pe/ui/library.cpp"
                 "${launcher_dir}/pe/ui/settings.cpp"
                 "${launcher_dir}/pe/ui/textures.cpp"
+                "${launcher_dir}/pe/ui/theme.cpp"
                 "${launcher_dir}/pe/ui/widgets.cpp")
             target_sources(eden-headless PRIVATE ${launcher_sources})
             # Download sources and their queue (remote/remote.h), with their backends (remote/source.h,
